@@ -1,0 +1,279 @@
+# =============================================================
+# Vector config: Wazuh Manager alerts.json -> OpenSearch
+# Purpose:
+# - Parse Wazuh alerts
+# - Route by OS using decoder.name
+# - Normalize Windows and Linux fields into ECS schema
+#   (custom/non-ECS fields are namespaced under .wazuh.*, not root)
+# - Filter rule.level >= 3
+# - Route logs to OpenSearch indices BY LOG TYPE/CHANNEL, not by agent:
+#     logs-windows-security / logs-windows-system / logs-windows-application
+#     logs-linux-auth       / logs-linux-journal
+# =============================================================
+
+data_dir: /var/lib/vector
+
+sources:
+  wazuh_alerts:
+    type: file
+    include:
+      - /var/ossec/logs/alerts/alerts.json
+    read_from: end
+    fingerprint:
+      strategy: device_and_inode
+
+transforms:
+
+  # -----------------------------------------------------------
+  # 1. Parse Wazuh alerts.json
+  #    Vector file source reads each line as .message (string).
+  #    This step converts .message from JSON string into real fields.
+  # -----------------------------------------------------------
+  parse_wazuh:
+    type: remap
+    inputs:
+      - wazuh_alerts
+    source: |
+      parsed, err = parse_json(.message)
+      if err != null {
+        log("Parse error: " + err, level: "warn")
+        abort
+      }
+      . = parsed
+
+  # -----------------------------------------------------------
+  # 2. Normalize common fields (applies to ALL OS)
+  #    ECS fields go to root (host.*, event.*).
+  #    Non-ECS / Wazuh-specific fields go under .wazuh.* namespace,
+  #    per ECS custom field naming guidelines - never mixed into root.
+  # -----------------------------------------------------------
+  normalize_common:
+    type: remap
+    inputs:
+      - parse_wazuh
+    source: |
+      # --- ECS: host.* ---
+      if exists(.agent.name) { .host.name = .agent.name }
+      if exists(.agent.id)   { .host.id   = .agent.id }
+
+      # --- ECS: event.* ---
+      if exists(.rule.level) {
+        level, err = to_int(.rule.level)
+        if err == null { .event.severity = level }
+      }
+      .event.kind = "event"
+
+      # --- ECS: related.* (optional, helps cross-field search) ---
+      if exists(.agent.ip) { .related.ip = [.agent.ip] }
+
+      # --- Non-ECS / Wazuh-specific fields -> namespaced, NOT in root ---
+      if exists(.rule.id)          { .wazuh.rule.id          = .rule.id }
+      if exists(.rule.description) { .wazuh.rule.description = .rule.description }
+      if exists(.rule.groups)      { .wazuh.rule.groups      = .rule.groups }
+      if exists(.manager.name)     { .wazuh.manager.name     = .manager.name }
+      if exists(.decoder.name)     { .wazuh.decoder.name     = .decoder.name }
+
+      # Vector pipeline metadata -> also namespaced, not root
+      .wazuh.vector_source = "wazuh-manager-A"
+
+  # -----------------------------------------------------------
+  # 3. Route by OS type using Wazuh decoder.name
+  #    windows -> route_by_os.windows
+  #    linux   -> route_by_os.linux
+  #    (add more OS routes here as needed)
+  # -----------------------------------------------------------
+  route_by_os:
+    type: route
+    inputs:
+      - normalize_common
+    route:
+      windows: '.wazuh.decoder.name == "windows_eventchannel"'
+      linux:   '.wazuh.decoder.name != "windows_eventchannel"'
+      # To add a new OS in the future, add a new route here:
+      # macos: '.wazuh.decoder.name == "apple_unified_log"'
+
+  # -----------------------------------------------------------
+  # 4a. Normalize Windows-specific fields into ECS.
+  #     ECS field set for Windows Event Log is `winlog.*`
+  #     (this is a real ECS field set, not a custom one).
+  #     Input: route_by_os.windows
+  # -----------------------------------------------------------
+  normalize_windows:
+    type: remap
+    inputs:
+      - route_by_os.windows
+    source: |
+      .event.module = "windows"
+
+      # --- ECS: winlog.* (official ECS field set for Windows events) ---
+      if exists(.data.win.system.eventID) {
+        event_id, err = to_int(.data.win.system.eventID)
+        if err == null {
+          .winlog.event_id = event_id
+          .event.code      = event_id
+        }
+      }
+
+      if exists(.data.win.system.channel)      { .winlog.channel       = .data.win.system.channel }
+      if exists(.data.win.system.providerName) { .winlog.provider_name = .data.win.system.providerName }
+      if exists(.data.win.system.computer)     { .winlog.computer_name = .data.win.system.computer }
+
+      if exists(.data.win.system.processID) {
+        pid, err = to_int(.data.win.system.processID)
+        if err == null { .winlog.process.pid = pid }
+      }
+
+      # --- ECS: host.hostname (the actual Windows machine, distinct from host.name/agent) ---
+      if exists(.data.win.system.computer) { .host.hostname = .data.win.system.computer }
+
+      # --- ECS: user.* ---
+      if exists(.data.win.eventdata.subjectUserName)   { .user.effective.name   = .data.win.eventdata.subjectUserName }
+      if exists(.data.win.eventdata.targetUserName)    { .user.target.name      = .data.win.eventdata.targetUserName }
+      if exists(.data.win.eventdata.subjectDomainName) { .user.effective.domain = .data.win.eventdata.subjectDomainName }
+      if exists(.data.win.eventdata.targetDomainName)  { .user.target.domain    = .data.win.eventdata.targetDomainName }
+
+      # --- ECS: source.ip ---
+      if exists(.data.win.eventdata.ipAddress) { .source.ip = .data.win.eventdata.ipAddress }
+
+      # -----------------------------------------------------------
+      # Index routing by CHANNEL, not by agent.
+      # This is the field used downstream by tag_index.
+      # -----------------------------------------------------------
+      channel = to_string(.winlog.channel) ?? "unknown"
+      .wazuh.index_group = if channel == "Security" {
+        "logs-windows-security"
+      } else if channel == "System" {
+        "logs-windows-system"
+      } else if channel == "Application" {
+        "logs-windows-application"
+      } else {
+        "logs-windows-other"
+      }
+
+  # -----------------------------------------------------------
+  # 4b. Normalize Linux/Kali-specific fields into ECS.
+  #     Input: route_by_os.linux
+  # -----------------------------------------------------------
+  normalize_linux:
+    type: remap
+    inputs:
+      - route_by_os.linux
+    source: |
+      .event.module = "linux"
+
+      decoder_name = to_string(.wazuh.decoder.name) ?? ""
+      .event.dataset = decoder_name  # e.g. "sshd", "sudo", "journald"
+
+      # --- ECS: source / destination ---
+      if exists(.data.srcip) { .source.ip = .data.srcip }
+      if exists(.data.dstip) { .destination.ip = .data.dstip }
+
+      if exists(.data.srcport) {
+        p, err = to_int(.data.srcport)
+        if err == null { .source.port = p }
+      }
+      if exists(.data.dstport) {
+        p, err = to_int(.data.dstport)
+        if err == null { .destination.port = p }
+      }
+
+      # --- ECS: user.* ---
+      if exists(.data.srcuser) { .user.name        = .data.srcuser }
+      if exists(.data.dstuser) { .user.target.name = .data.dstuser }
+
+      # --- ECS: process.* ---
+      if exists(.data.command)               { .process.command_line = .data.command }
+      if exists(.predecoder.program_name)    { .process.name         = .predecoder.program_name }
+
+      # --- ECS: network / url ---
+      if exists(.data.protocol) { .network.transport = .data.protocol }
+      if exists(.data.url)      { .url.original       = .data.url }
+
+      # --- ECS: file.* (File Integrity Monitoring via syscheck) ---
+      is_fim = exists(.syscheck.path)
+      if is_fim {
+        .file.path      = .syscheck.path
+        .event.dataset  = "linux.fim"
+        if exists(.syscheck.event) { .event.action = .syscheck.event }
+      }
+
+      # -----------------------------------------------------------
+      # Index routing by LOG TYPE, not by agent.
+      # auth    -> authentication-related decoders (sshd, sudo, su, pam)
+      # journal -> generic systemd/journald logs (location == "journald"
+      #            and not already classified as auth)
+      # fim     -> file integrity monitoring events
+      # other   -> anything else (fallback)
+      # -----------------------------------------------------------
+      is_auth_decoder = includes(["sshd", "sudo", "su", "pam", "useradd", "userdel", "passwd"], decoder_name)
+      location = to_string(.location) ?? ""
+
+      .wazuh.index_group = if is_fim {
+        "logs-linux-fim"
+      } else if is_auth_decoder {
+        "logs-linux-auth"
+      } else if location == "journald" {
+        "logs-linux-journal"
+      } else {
+        "logs-linux-other"
+      }
+
+      # To add a new OS in the future:
+      # 1. Add a new route in route_by_os
+      # 2. Add a new normalize_<os> transform here, setting .wazuh.index_group
+      # 3. Add the new transform to filter_level inputs
+
+  # -----------------------------------------------------------
+  # 5. Merge all OS branches and filter by rule.level >= 3
+  # -----------------------------------------------------------
+  filter_level:
+    type: filter
+    inputs:
+      - normalize_windows
+      - normalize_linux
+      # Add new OS normalize transforms to inputs here when needed
+    condition: |
+      level, err = to_int(.event.severity)
+      if err != null { level = 0 }
+      level >= 3
+
+sinks:
+  opensearch:
+    type: elasticsearch
+    inputs:
+      - filter_level
+
+    endpoints:
+      - "https://192.168.75.145:9200"
+
+    api_version: v8
+    opensearch_service_type: managed
+    mode: bulk
+
+    bulk:
+      action: index
+      # Index name now comes from .wazuh.index_group (set per channel/log type
+      # in normalize_windows / normalize_linux), NOT from agent identity.
+      index: "{{ wazuh.index_group }}-%Y.%m.%d"
+
+    batch:
+      max_events: 200
+      max_bytes: 1048576
+      timeout_secs: 5
+
+    auth:
+      strategy: basic
+      user: "admin"
+      password: "${OPENSEARCH_PASSWORD}"
+
+    tls:
+      verify_certificate: false
+      verify_hostname: false
+
+    healthcheck:
+      enabled: false
+
+    request:
+      concurrency: 1
+      retry_attempts: 10
+      retry_initial_backoff_secs: 5
